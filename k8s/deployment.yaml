@@ -1,0 +1,35 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-scheduler
+  namespace: kube-system
+  labels:
+    app: custom-scheduler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-scheduler
+  template:
+    metadata:
+      labels:
+        app: custom-scheduler
+    spec:
+      serviceAccountName: custom-scheduler
+      nodeName: custom-scheduler-demo
+      containers:
+      - name: scheduler
+        image: custom-scheduler:latest
+        imagePullPolicy: Never
+        env:
+        - name: SCHEDULER_NAME
+          value: "custom-scheduler"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+

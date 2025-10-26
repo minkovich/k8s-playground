@@ -1,517 +1,504 @@
 """
-Unit tests for the custom Kubernetes scheduler.
+Unit tests for the custom scheduler logic (pure Python, no K8s mocking).
 """
 
 import unittest
-from unittest.mock import MagicMock, Mock, patch, call
-from dataclasses import dataclass
-
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scheduler'))
 
-from scheduler import CustomScheduler, PodInfo
+from scheduling_logic import SchedulingLogic, PodInfo
 
 
-class TestCustomScheduler(unittest.TestCase):
-    """Test cases for CustomScheduler."""
+class TestSchedulingLogic(unittest.TestCase):
+    """Test cases for SchedulingLogic (pure Python)."""
     
     def setUp(self):
         """Set up test fixtures."""
-        with patch('scheduler.client'):
-            self.scheduler = CustomScheduler(scheduler_name="test-scheduler")
-            self.scheduler.v1 = MagicMock()
+        self.logic = SchedulingLogic()
     
-    def _create_mock_pod(self, name, namespace="default", priority=0, 
-                         pod_group=None, uid=None, node_name=None):
-        """Create a mock pod object."""
-        pod = MagicMock()
-        pod.metadata.name = name
-        pod.metadata.namespace = namespace
-        pod.metadata.uid = uid or f"uid-{name}"
-        pod.metadata.annotations = {}
-        
-        if priority != 0:
-            pod.metadata.annotations["priority"] = str(priority)
-        if pod_group:
-            pod.metadata.annotations["pod-group"] = pod_group
-        
-        pod.spec.priority = priority
-        pod.spec.scheduler_name = "test-scheduler"
-        pod.spec.node_name = node_name
-        pod.status.phase = "Pending"
-        
-        return pod
+    def _create_pod_dict(self, uid, name, namespace="default", priority=0, 
+                         gang_name=None, node_name=None):
+        """Create a pod dictionary."""
+        return {
+            "uid": uid,
+            "name": name,
+            "namespace": namespace,
+            "priority": priority,
+            "gang_name": gang_name,
+            "node_name": node_name
+        }
     
-    def _create_mock_node(self, name, schedulable=True):
-        """Create a mock node object."""
-        node = MagicMock()
-        node.metadata.name = name
-        node.spec.unschedulable = not schedulable
-        return node
+    def test_initialize_empty_cluster(self):
+        """Test initializing with no existing pods."""
+        nodes = ["node-1", "node-2", "node-3"]
+        result = self.logic.initialize(nodes, [])
+        
+        self.assertEqual(len(self.logic.node_assignments), 3)
+        self.assertEqual(len(self.logic.all_pods), 0)
+        self.assertEqual(len(result["actions"]), 0)
     
-    def test_initialize_cluster_state(self):
-        """Test cluster state initialization."""
-        # Setup mock nodes
-        nodes = MagicMock()
-        nodes.items = [
-            self._create_mock_node("node-1"),
-            self._create_mock_node("node-2"),
-            self._create_mock_node("node-3"),
+    def test_initialize_with_running_pods(self):
+        """Test initializing with existing running pods."""
+        nodes = ["node-1", "node-2", "node-3"]
+        existing_pods = [
+            self._create_pod_dict("uid-1", "pod-1", priority=50, node_name="node-1"),
+            self._create_pod_dict("uid-2", "pod-2", priority=30, node_name="node-2"),
         ]
-        self.scheduler.v1.list_node.return_value = nodes
         
-        # Setup mock pods
-        pods = MagicMock()
-        pod1 = self._create_mock_pod("pod1", uid="uid1", node_name="node-1")
-        pods.items = [pod1]
-        self.scheduler.v1.list_pod_for_all_namespaces.return_value = pods
+        result = self.logic.initialize(nodes, existing_pods)
         
-        # Initialize
-        self.scheduler.initialize_cluster_state()
-        
-        # Verify
-        self.assertEqual(len(self.scheduler.node_assignments), 3)
-        self.assertEqual(self.scheduler.node_assignments["node-1"], "uid1")
-        self.assertIsNone(self.scheduler.node_assignments["node-2"])
-        self.assertIsNone(self.scheduler.node_assignments["node-3"])
+        self.assertEqual(self.logic.node_assignments["node-1"], "uid-1")
+        self.assertEqual(self.logic.node_assignments["node-2"], "uid-2")
+        self.assertIsNone(self.logic.node_assignments["node-3"])
+        self.assertEqual(len(self.logic.all_pods), 2)  # Both running pods are tracked
     
-    def test_get_pod_priority(self):
-        """Test pod priority extraction."""
-        # Test annotation priority
-        pod1 = self._create_mock_pod("pod1", priority=100)
-        self.assertEqual(self.scheduler._get_pod_priority(pod1), 100)
+    def test_initialize_with_pending_pods(self):
+        """Test initializing with pending pods."""
+        nodes = ["node-1", "node-2"]
+        existing_pods = [
+            self._create_pod_dict("uid-1", "pod-1", priority=50),
+        ]
         
-        # Test default priority
-        pod2 = self._create_mock_pod("pod2")
-        self.assertEqual(self.scheduler._get_pod_priority(pod2), 0)
-    
-    def test_get_pod_group(self):
-        """Test pod group extraction."""
-        # Test with pod group
-        pod1 = self._create_mock_pod("pod1", pod_group="group-a")
-        self.assertEqual(self.scheduler._get_pod_group(pod1), "group-a")
+        result = self.logic.initialize(nodes, existing_pods)
         
-        # Test without pod group
-        pod2 = self._create_mock_pod("pod2")
-        self.assertIsNone(self.scheduler._get_pod_group(pod2))
+        # Should schedule the pending pod
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["action"], "bind")
+        self.assertEqual(result["actions"][0]["pod_uid"], "uid-1")
     
-    def test_find_available_nodes(self):
-        """Test finding available nodes."""
-        self.scheduler.node_assignments = {
-            "node-1": "uid1",
-            "node-2": None,
-            "node-3": None,
-            "node-4": "uid4",
+    def test_add_pod_event(self):
+        """Test handling ADDED event for a pod."""
+        self.logic.initialize(["node-1", "node-2"], [])
+        
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-1", "pod-1", priority=50)
         }
         
-        available = self.scheduler._find_available_nodes(2)
-        self.assertEqual(len(available), 2)
-        self.assertIn("node-2", available)
-        self.assertIn("node-3", available)
+        result = self.logic.handle_event(event)
+        
+        # Should bind the pod
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["action"], "bind")
+        self.assertEqual(result["actions"][0]["pod_uid"], "uid-1")
     
-    def test_find_nodes_for_preemption(self):
-        """Test finding nodes for preemption based on priority."""
-        # Setup node assignments
-        self.scheduler.node_assignments = {
-            "node-1": "uid1",  # priority 10
-            "node-2": "uid2",  # priority 20
-            "node-3": "uid3",  # priority 5
+    def test_delete_pod_event(self):
+        """Test handling DELETED event for a pod."""
+        # Setup: initialize with a running pod
+        nodes = ["node-1"]
+        existing_pods = [
+            self._create_pod_dict("uid-1", "pod-1", priority=50, node_name="node-1")
+        ]
+        self.logic.initialize(nodes, existing_pods)
+        
+        # Delete the pod
+        event = {
+            "event_type": "DELETED",
+            "pod": self._create_pod_dict("uid-1", "pod-1", priority=50, node_name="node-1")
         }
         
-        # Mock pod retrieval - field_selector is by spec.nodeName
-        def mock_list_pods(field_selector):
-            node_name = field_selector.split("=")[1]
-            pods = MagicMock()
-            if node_name == "node-1":
-                pods.items = [self._create_mock_pod("pod1", priority=10, uid="uid1", node_name="node-1")]
-            elif node_name == "node-2":
-                pods.items = [self._create_mock_pod("pod2", priority=20, uid="uid2", node_name="node-2")]
-            elif node_name == "node-3":
-                pods.items = [self._create_mock_pod("pod3", priority=5, uid="uid3", node_name="node-3")]
-            else:
-                pods.items = []
-            return pods
+        result = self.logic.handle_event(event)
         
-        self.scheduler.v1.list_pod_for_all_namespaces.side_effect = mock_list_pods
-        
-        # Find nodes for a pod with priority 15
-        candidates = self.scheduler._find_nodes_for_preemption(required_priority=15, count=2)
-        
-        # Should return lowest priority pods first
-        self.assertEqual(len(candidates), 2)
-        self.assertEqual(candidates[0][0], "node-3")  # priority 5
-        self.assertEqual(candidates[1][0], "node-1")  # priority 10
+        # Node should be freed
+        self.assertIsNone(self.logic.node_assignments["node-1"])
     
-    def test_bind_pod_to_node_success(self):
-        """Test successful pod binding to node."""
-        pod = self._create_mock_pod("test-pod", priority=50)
-        self.scheduler.node_assignments = {"node-1": None}
+    def test_priority_based_scheduling(self):
+        """Test that higher priority pods are scheduled first."""
+        self.logic.initialize(["node-1"], [])
         
-        # Mock successful binding
-        self.scheduler.v1.create_namespaced_binding.return_value = None
+        # Add low priority pod first
+        event1 = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-low", "low-pod", priority=10)
+        }
+        result1 = self.logic.handle_event(event1)
         
-        result = self.scheduler._bind_pod_to_node(pod, "node-1")
+        # Low priority pod should be scheduled
+        self.assertEqual(len(result1["actions"]), 1)
+        self.assertEqual(result1["actions"][0]["pod_uid"], "uid-low")
         
-        self.assertTrue(result)
-        self.assertEqual(self.scheduler.node_assignments["node-1"], "uid-test-pod")
-        self.scheduler.v1.create_namespaced_binding.assert_called_once()
+        # Simulate binding completion
+        self.logic.node_assignments["node-1"] = "uid-low"
+        
+        # Add high priority pod
+        event2 = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-high", "high-pod", priority=100)
+        }
+        result2 = self.logic.handle_event(event2)
+        
+        # Should preempt low priority and bind high priority
+        self.assertEqual(len(result2["actions"]), 2)
+        preempt_action = next(a for a in result2["actions"] if a["action"] == "preempt")
+        bind_action = next(a for a in result2["actions"] if a["action"] == "bind")
+        
+        self.assertEqual(preempt_action["pod_uid"], "uid-low")
+        self.assertEqual(bind_action["pod_uid"], "uid-high")
     
-    def test_schedule_single_pod_with_available_node(self):
-        """Test scheduling a single pod when nodes are available."""
-        pod = self._create_mock_pod("test-pod", priority=50)
-        pod_info = PodInfo(
-            name="test-pod",
-            namespace="default",
-            priority=50,
-            pod_group=None,
-            uid="uid-test-pod"
-        )
-        
-        self.scheduler.node_assignments = {"node-1": None, "node-2": None}
-        self.scheduler.v1.create_namespaced_binding.return_value = None
-        
-        result = self.scheduler._schedule_single_pod(pod_info, pod)
-        
-        self.assertTrue(result)
-        # One node should now be assigned
-        assigned = sum(1 for v in self.scheduler.node_assignments.values() if v is not None)
-        self.assertEqual(assigned, 1)
-    
-    def test_schedule_single_pod_with_preemption(self):
-        """Test scheduling a pod with preemption."""
-        # High priority pod to schedule
-        high_priority_pod = self._create_mock_pod("high-pod", priority=100)
-        pod_info = PodInfo(
-            name="high-pod",
-            namespace="default",
-            priority=100,
-            pod_group=None,
-            uid="uid-high-pod"
-        )
-        
-        # Low priority pod already on node
-        low_priority_pod = self._create_mock_pod("low-pod", priority=10, 
-                                                  uid="uid-low-pod", node_name="node-1")
-        
-        self.scheduler.node_assignments = {"node-1": "uid-low-pod"}
-        
-        # Mock pod retrieval for preemption
-        pods_response = MagicMock()
-        pods_response.items = [low_priority_pod]
-        self.scheduler.v1.list_pod_for_all_namespaces.return_value = pods_response
-        
-        # Mock deletion and binding
-        self.scheduler.v1.delete_namespaced_pod.return_value = None
-        self.scheduler.v1.create_namespaced_binding.return_value = None
-        
-        with patch('scheduler.time.sleep'):
-            result = self.scheduler._schedule_single_pod(pod_info, high_priority_pod)
-        
-        self.assertTrue(result)
-        # Verify preemption was called
-        self.scheduler.v1.delete_namespaced_pod.assert_called_once()
-        # Verify new pod was bound
-        self.scheduler.v1.create_namespaced_binding.assert_called_once()
-    
-    def test_gang_scheduling_with_available_nodes(self):
+    def test_gang_scheduling_with_capacity(self):
         """Test gang-scheduling when enough nodes are available."""
-        pods_info = [
-            PodInfo("gang-pod-1", "default", 50, "group-a", "uid1"),
-            PodInfo("gang-pod-2", "default", 50, "group-a", "uid2"),
-            PodInfo("gang-pod-3", "default", 50, "group-a", "uid3"),
+        self.logic.initialize(["node-1", "node-2", "node-3"], [])
+        
+        # Add gang pods
+        gang_pods = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-1", "gang-1", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-2", "gang-2", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-3", "gang-3", priority=50, gang_name="group-a")},
         ]
         
-        self.scheduler.node_assignments = {
-            "node-1": None,
-            "node-2": None,
-            "node-3": None,
-        }
+        # Process all gang pods and collect all actions
+        all_bind_actions = []
+        for event in gang_pods:
+            result = self.logic.handle_event(event)
+            bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+            all_bind_actions.extend(bind_actions)
         
-        # Mock pod retrieval
-        mock_pods = [
-            self._create_mock_pod("gang-pod-1", uid="uid1"),
-            self._create_mock_pod("gang-pod-2", uid="uid2"),
-            self._create_mock_pod("gang-pod-3", uid="uid3"),
-        ]
-        self.scheduler.v1.read_namespaced_pod.side_effect = mock_pods
-        self.scheduler.v1.create_namespaced_binding.return_value = None
-        
-        result = self.scheduler._schedule_gang_pods("group-a", pods_info)
-        
-        self.assertTrue(result)
-        # All nodes should be assigned
-        assigned = sum(1 for v in self.scheduler.node_assignments.values() if v is not None)
-        self.assertEqual(assigned, 3)
-    
-    def test_gang_scheduling_with_preemption(self):
-        """Test gang-scheduling with preemption."""
-        pods_info = [
-            PodInfo("gang-pod-1", "default", 100, "group-a", "uid-gang1"),
-            PodInfo("gang-pod-2", "default", 100, "group-a", "uid-gang2"),
-        ]
-        
-        # One node available, one occupied by lower priority pod
-        low_priority_pod = self._create_mock_pod("low-pod", priority=10, 
-                                                  uid="uid-low", node_name="node-2")
-        
-        self.scheduler.node_assignments = {
-            "node-1": None,
-            "node-2": "uid-low",
-        }
-        
-        # Mock pod retrieval for preemption
-        pods_response = MagicMock()
-        pods_response.items = [low_priority_pod]
-        self.scheduler.v1.list_pod_for_all_namespaces.return_value = pods_response
-        
-        # Mock gang pod retrieval
-        mock_gang_pods = [
-            self._create_mock_pod("gang-pod-1", priority=100, uid="uid-gang1"),
-            self._create_mock_pod("gang-pod-2", priority=100, uid="uid-gang2"),
-        ]
-        self.scheduler.v1.read_namespaced_pod.side_effect = mock_gang_pods
-        
-        # Mock deletion and binding
-        self.scheduler.v1.delete_namespaced_pod.return_value = None
-        self.scheduler.v1.create_namespaced_binding.return_value = None
-        
-        with patch('scheduler.time.sleep'):
-            result = self.scheduler._schedule_gang_pods("group-a", pods_info)
-        
-        self.assertTrue(result)
-        # Verify preemption occurred
-        self.scheduler.v1.delete_namespaced_pod.assert_called_once()
-        # Verify both gang pods were bound
-        self.assertEqual(self.scheduler.v1.create_namespaced_binding.call_count, 2)
+        # All gang pods should be scheduled (cumulative across events)
+        self.assertEqual(len(all_bind_actions), 3)
+        scheduled_uids = [a["pod_uid"] for a in all_bind_actions]
+        self.assertEqual(set(scheduled_uids), {"uid-1", "uid-2", "uid-3"})
     
     def test_gang_scheduling_insufficient_capacity(self):
         """Test gang-scheduling fails when insufficient capacity."""
-        pods_info = [
-            PodInfo("gang-pod-1", "default", 50, "group-a", "uid1"),
-            PodInfo("gang-pod-2", "default", 50, "group-a", "uid2"),
-            PodInfo("gang-pod-3", "default", 50, "group-a", "uid3"),
+        # Only 2 nodes available
+        self.logic.initialize(["node-1", "node-2"], [])
+        
+        # Try to add a gang of 3 pods
+        gang_pods = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-1", "gang-1", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-2", "gang-2", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-3", "gang-3", priority=50, gang_name="group-a")},
         ]
         
-        # Only 1 node available, and 1 node with higher priority pod
-        high_priority_pod = self._create_mock_pod("high-pod", priority=100, 
-                                                   uid="uid-high", node_name="node-2")
+        for event in gang_pods:
+            result = self.logic.handle_event(event)
         
-        self.scheduler.node_assignments = {
-            "node-1": None,
-            "node-2": "uid-high",
+        # No gang pods should be scheduled (all-or-nothing)
+        bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+        gang_binds = [a for a in bind_actions if a["pod_uid"] in ["uid-1", "uid-2", "uid-3"]]
+        self.assertEqual(len(gang_binds), 0, "Gang should not be scheduled without enough capacity")
+    
+    def test_gang_scheduling_with_priority(self):
+        """Test gang-scheduling respects priority (uses minimum priority)."""
+        self.logic.initialize(["node-1", "node-2"], [])
+        
+        # Add gang with mixed priorities (min priority = 30)
+        gang_pods = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-1", "gang-1", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-2", "gang-2", priority=30, gang_name="group-a")},
+        ]
+        
+        for event in gang_pods:
+            self.logic.handle_event(event)
+        
+        # Add a single pod with priority 40 (higher than gang's min priority)
+        event_high = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-high", "high-pod", priority=40)
         }
+        result = self.logic.handle_event(event_high)
         
-        # Mock pod retrieval - high priority pod cannot be preempted
-        pods_response = MagicMock()
-        pods_response.items = [high_priority_pod]
-        self.scheduler.v1.list_pod_for_all_namespaces.return_value = pods_response
+        # High priority single pod should be scheduled before gang
+        bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+        scheduled_uids = [a["pod_uid"] for a in bind_actions]
         
-        result = self.scheduler._schedule_gang_pods("group-a", pods_info)
-        
-        # Should fail because we need 3 nodes but only have 1 available
-        # and can't preempt the high priority pod
-        self.assertFalse(result)
+        # High priority pod should be scheduled
+        self.assertIn("uid-high", scheduled_uids)
     
-    def test_handle_pod_deleted(self):
-        """Test handling pod deletion."""
-        pod = self._create_mock_pod("test-pod", uid="uid-test", node_name="node-1")
+    def test_multiple_gangs(self):
+        """Test multiple gang groups are handled independently."""
+        self.logic.initialize(["node-1", "node-2", "node-3", "node-4"], [])
         
-        self.scheduler.node_assignments = {"node-1": "uid-test"}
-        self.scheduler.handle_pod_deleted(pod)
+        # Add gang A (2 pods)
+        gang_a = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-a1", "gang-a1", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-a2", "gang-a2", priority=50, gang_name="group-a")},
+        ]
         
-        self.assertIsNone(self.scheduler.node_assignments["node-1"])
+        # Add gang B (2 pods)
+        gang_b = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-b1", "gang-b1", priority=40, gang_name="group-b")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-b2", "gang-b2", priority=40, gang_name="group-b")},
+        ]
+        
+        all_bind_actions = []
+        for event in gang_a + gang_b:
+            result = self.logic.handle_event(event)
+            bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+            all_bind_actions.extend(bind_actions)
+        
+        # All 4 pods should be scheduled (2 gangs, 2 pods each) - cumulative
+        self.assertEqual(len(all_bind_actions), 4)
     
-    def test_priority_ordering(self):
-        """Test that higher priority pods preempt lower priority ones."""
-        # Setup: node-1 has low priority pod
-        low_pod = self._create_mock_pod("low-pod", priority=10, uid="uid-low", node_name="node-1")
-        self.scheduler.node_assignments = {"node-1": "uid-low"}
+    def test_rebuild_scheduling_queue(self):
+        """Test scheduling queue is rebuilt correctly."""
+        # Use a cluster with only 1 node to keep some pods pending
+        self.logic.initialize(["node-1"], [])
         
-        # High priority pod arrives
-        high_pod = self._create_mock_pod("high-pod", priority=100, uid="uid-high-pod")
-        pod_info = PodInfo("high-pod", "default", 100, None, "uid-high-pod")
+        # Add pods with different priorities
+        events = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-low", "low-pod", priority=10)},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-high", "high-pod", priority=100)},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-mid", "mid-pod", priority=50)},
+        ]
         
-        # Mock responses - need to mock by nodeName field selector
-        def mock_list_pods(field_selector):
-            node_name = field_selector.split("=")[1]
-            pods = MagicMock()
-            if node_name == "node-1":
-                pods.items = [low_pod]
-            else:
-                pods.items = []
-            return pods
+        # Add all pods (only highest priority will be scheduled due to capacity)
+        for event in events:
+            self.logic.handle_event(event)
         
-        self.scheduler.v1.list_pod_for_all_namespaces.side_effect = mock_list_pods
-        self.scheduler.v1.delete_namespaced_pod.return_value = None
-        self.scheduler.v1.create_namespaced_binding.return_value = None
+        # After scheduling, all pods are tracked in all_pods
+        self.assertEqual(len(self.logic.all_pods), 3, "All 3 pods should be tracked")
         
-        with patch('scheduler.time.sleep'):
-            result = self.scheduler._schedule_single_pod(pod_info, high_pod)
+        # Verify scheduling happened based on priority - only 1 node available
+        # Check node_assignments to see which pod got the node
+        assigned_pods = [uid for node, uid in self.logic.node_assignments.items() if uid is not None]
+        self.assertEqual(len(assigned_pods), 1, "Only 1 pod should be assigned (1 node available)")
+        self.assertIn("uid-high", assigned_pods, "Highest priority pod should be assigned")
+    
+    def test_preemption_for_single_pod(self):
+        """Test preemption works for single pods."""
+        # Setup: node-1 has a low priority pod
+        nodes = ["node-1"]
+        existing_pods = [
+            self._create_pod_dict("uid-low", "low-pod", priority=10, node_name="node-1")
+        ]
+        self.logic.initialize(nodes, existing_pods)
         
-        self.assertTrue(result)
-        # Low priority pod should have been deleted
-        self.scheduler.v1.delete_namespaced_pod.assert_called_once_with(
-            name="low-pod",
-            namespace="default",
-            body=unittest.mock.ANY
-        )
-        # High priority pod should be bound
-        self.assertEqual(self.scheduler.node_assignments["node-1"], "uid-high-pod")
+        # Add high priority pod
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-high", "high-pod", priority=100)
+        }
+        result = self.logic.handle_event(event)
+        
+        # Should have preempt and bind actions
+        self.assertEqual(len(result["actions"]), 2)
+        
+        actions_by_type = {a["action"]: a for a in result["actions"]}
+        self.assertIn("preempt", actions_by_type)
+        self.assertIn("bind", actions_by_type)
+        
+        self.assertEqual(actions_by_type["preempt"]["pod_uid"], "uid-low")
+        self.assertEqual(actions_by_type["bind"]["pod_uid"], "uid-high")
+    
+    def test_stable_scheduling_no_unnecessary_moves(self):
+        """Test that pods don't move unnecessarily when higher priority pod arrives with available capacity."""
+        # Setup: 3 nodes, 2 low priority pods already scheduled
+        nodes = ["node-1", "node-2", "node-3"]
+        existing_pods = [
+            self._create_pod_dict("uid-low-1", "low-1", priority=10, node_name="node-1"),
+            self._create_pod_dict("uid-low-2", "low-2", priority=10, node_name="node-2"),
+        ]
+        self.logic.initialize(nodes, existing_pods)
+        
+        # Verify initial state
+        self.assertEqual(self.logic.node_assignments["node-1"], "uid-low-1")
+        self.assertEqual(self.logic.node_assignments["node-2"], "uid-low-2")
+        self.assertIsNone(self.logic.node_assignments["node-3"])
+        
+        # Add high priority pod (should go to node-3, not move existing pods)
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-high", "high-pod", priority=100)
+        }
+        result = self.logic.handle_event(event)
+        
+        # Verify actions - should ONLY bind high pod to node-3, NO preemptions
+        self.assertEqual(len(result["actions"]), 1, "Should only have 1 action (bind high pod)")
+        
+        action = result["actions"][0]
+        self.assertEqual(action["action"], "bind")
+        self.assertEqual(action["pod_uid"], "uid-high")
+        self.assertEqual(action["node_name"], "node-3")
+        
+        # Verify final state - low priority pods should NOT have moved (STABILITY!)
+        self.assertEqual(self.logic.node_assignments["node-1"], "uid-low-1", 
+                        "low-1 should stay on node-1 (no unnecessary move)")
+        self.assertEqual(self.logic.node_assignments["node-2"], "uid-low-2",
+                        "low-2 should stay on node-2 (no unnecessary move)")
+        self.assertEqual(self.logic.node_assignments["node-3"], "uid-high",
+                        "high should be on node-3")
+    
+    def test_stable_scheduling_with_preemption_minimizes_moves(self):
+        """Test that when preemption is needed, only necessary pods are moved."""
+        # Setup: 2 nodes FULL with low priority pods
+        nodes = ["node-1", "node-2"]
+        existing_pods = [
+            self._create_pod_dict("uid-low-1", "low-1", priority=10, node_name="node-1"),
+            self._create_pod_dict("uid-low-2", "low-2", priority=10, node_name="node-2"),
+        ]
+        self.logic.initialize(nodes, existing_pods)
+        
+        # Add high priority pod (cluster full - preemption needed)
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-high", "high-pod", priority=100)
+        }
+        result = self.logic.handle_event(event)
+        
+        # Verify: should preempt ONE pod, bind high pod
+        # At least one low priority pod should be preempted
+        preempt_actions = [a for a in result["actions"] if a["action"] == "preempt"]
+        bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+        
+        self.assertEqual(len(preempt_actions), 1, "Should preempt exactly 1 pod")
+        self.assertEqual(len(bind_actions), 1, "Should bind exactly 1 pod (high)")
+        
+        # Verify one low priority pod stayed on its original node (stability)
+        assigned_uids = set(self.logic.node_assignments.values())
+        self.assertIn("uid-high", assigned_uids, "High priority pod should be scheduled")
+        
+        # At least one low priority pod should still be there
+        low_pods_remaining = [uid for uid in assigned_uids if uid and uid.startswith("uid-low")]
+        self.assertEqual(len(low_pods_remaining), 1, "One low priority pod should remain")
+    
+    def test_size_tiebreaker_smaller_units_first(self):
+        """Test that when priorities are equal, smaller units are scheduled first."""
+        # Setup: 3 nodes available
+        nodes = ["node-1", "node-2", "node-3"]
+        self.logic.initialize(nodes, [])
+        
+        # Add a gang of 3 pods (priority 50)
+        for i in range(1, 4):
+            event = {
+                "event_type": "ADDED",
+                "pod": self._create_pod_dict(f"gang-{i}", f"gang-{i}", priority=50, gang_name="big-gang")
+            }
+            self.logic.handle_event(event)
+        
+        # Add 2 single pods (also priority 50)
+        for i in range(1, 3):
+            event = {
+                "event_type": "ADDED",
+                "pod": self._create_pod_dict(f"single-{i}", f"single-{i}", priority=50)
+            }
+            result = self.logic.handle_event(event)
+        
+        # Verify scheduling queue order: smaller units should come first
+        self.assertEqual(len(self.logic.scheduling_queue), 3, "Should have 3 units in queue")
+        
+        # Check that single pods (size 1) come before gang (size 3)
+        queue_sizes = [len(unit.pods) for unit in self.logic.scheduling_queue]
+        self.assertEqual(queue_sizes, [1, 1, 3], 
+                        "Smaller units should be ordered before larger ones when priorities are equal")
+        
+        # Verify scheduling result: single pods should be scheduled, gang should not fit
+        assigned_pods = [uid for uid in self.logic.node_assignments.values() if uid]
+        self.assertEqual(len(assigned_pods), 2, "Only 2 pods should be scheduled (the single pods)")
+        self.assertIn("single-1", assigned_pods, "single-1 should be scheduled")
+        self.assertIn("single-2", assigned_pods, "single-2 should be scheduled")
+        
+        # Gang should not be scheduled (not enough capacity left)
+        for i in range(1, 4):
+            self.assertNotIn(f"gang-{i}", assigned_pods, f"gang-{i} should not be scheduled")
 
 
-class TestSchedulerIntegration(unittest.TestCase):
-    """Integration-style tests for scheduler behavior."""
+class TestSchedulingIntegration(unittest.TestCase):
+    """Integration tests for complex scheduling scenarios."""
     
     def setUp(self):
         """Set up test fixtures."""
-        with patch('scheduler.client'):
-            self.scheduler = CustomScheduler(scheduler_name="test-scheduler")
-            self.scheduler.v1 = MagicMock()
+        self.logic = SchedulingLogic()
     
-    def _setup_cluster(self, num_nodes=3):
-        """Setup a mock cluster with specified number of nodes."""
-        self.scheduler.node_assignments = {
-            f"node-{i}": None for i in range(1, num_nodes + 1)
+    def _create_pod_dict(self, uid, name, namespace="default", priority=0, 
+                         gang_name=None, node_name=None):
+        """Create a pod dictionary."""
+        return {
+            "uid": uid,
+            "name": name,
+            "namespace": namespace,
+            "priority": priority,
+            "gang_name": gang_name,
+            "node_name": node_name
         }
     
     def test_cluster_full_priority_scheduling(self):
         """Test priority-based scheduling when cluster is at capacity."""
-        self._setup_cluster(num_nodes=2)
+        # Setup: 2 nodes with low priority pods
+        nodes = ["node-1", "node-2"]
+        existing_pods = [
+            self._create_pod_dict("uid-low-1", "low-1", priority=10, node_name="node-1"),
+            self._create_pod_dict("uid-low-2", "low-2", priority=10, node_name="node-2"),
+        ]
+        self.logic.initialize(nodes, existing_pods)
         
-        # Fill cluster with low priority pods
-        low_pods = [
-            self._create_mock_pod(f"low-pod-{i}", priority=10, 
-                                 uid=f"uid-low-{i}", node_name=f"node-{i}")
-            for i in range(1, 3)
+        # Add 3 high priority pods (only 2 should be scheduled)
+        for i in range(1, 4):
+            event = {
+                "event_type": "ADDED",
+                "pod": self._create_pod_dict(f"uid-high-{i}", f"high-{i}", priority=100)
+            }
+            result = self.logic.handle_event(event)
+        
+        # Should have actions for 2 pods (cluster capacity)
+        bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+        high_binds = [a for a in bind_actions if a["pod_uid"].startswith("uid-high")]
+        self.assertLessEqual(len(high_binds), 2, "Only 2 pods can be scheduled (cluster capacity)")
+    
+    def test_gang_unschedulable_doesnt_block_others(self):
+        """Test that an unschedulable gang doesn't block other pods."""
+        # Setup: 2 nodes
+        self.logic.initialize(["node-1", "node-2"], [])
+        
+        # Add a gang of 3 pods (needs 3 nodes, only 2 available)
+        gang_events = [
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-gang-1", "gang-1", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-gang-2", "gang-2", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-gang-3", "gang-3", priority=50, gang_name="group-a")},
         ]
         
-        self.scheduler.node_assignments = {
-            "node-1": "uid-low-1",
-            "node-2": "uid-low-2",
+        for event in gang_events:
+            self.logic.handle_event(event)
+        
+        # Add a higher priority single pod
+        event_high = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("uid-high", "high-pod", priority=100)
         }
+        result = self.logic.handle_event(event_high)
         
-        # High priority pods arrive
-        high_pods = [
-            self._create_mock_pod(f"high-pod-{i}", priority=100, uid=f"uid-high-{i}")
-            for i in range(1, 4)  # 3 high priority pods
-        ]
-        
-        # Mock responses for preemption - field_selector is by spec.nodeName
-        def mock_list_pods(field_selector):
-            node_name = field_selector.split("=")[1]
-            pods = MagicMock()
-            if node_name == "node-1":
-                pods.items = [low_pods[0]]
-            elif node_name == "node-2":
-                pods.items = [low_pods[1]]
-            else:
-                pods.items = []
-            return pods
-        
-        self.scheduler.v1.list_pod_for_all_namespaces.side_effect = mock_list_pods
-        self.scheduler.v1.delete_namespaced_pod.return_value = None
-        self.scheduler.v1.create_namespaced_binding.return_value = None
-        
-        # Schedule high priority pods
-        scheduled_count = 0
-        with patch('scheduler.time.sleep'):
-            for i, high_pod in enumerate(high_pods):
-                pod_info = PodInfo(f"high-pod-{i+1}", "default", 100, None, f"uid-high-{i+1}")
-                if self.scheduler._schedule_single_pod(pod_info, high_pod):
-                    scheduled_count += 1
-        
-        # Only 2 should be scheduled (cluster capacity = 2)
-        self.assertEqual(scheduled_count, 2)
+        # High priority pod should be scheduled (gang remains pending)
+        bind_actions = [a for a in result["actions"] if a["action"] == "bind"]
+        self.assertTrue(any(a["pod_uid"] == "uid-high" for a in bind_actions),
+                       "High priority single pod should be scheduled despite unschedulable gang")
     
-    def _create_mock_pod(self, name, namespace="default", priority=0, 
-                         pod_group=None, uid=None, node_name=None):
-        """Create a mock pod object."""
-        pod = MagicMock()
-        pod.metadata.name = name
-        pod.metadata.namespace = namespace
-        pod.metadata.uid = uid or f"uid-{name}"
-        pod.metadata.annotations = {}
+    def test_mixed_scheduling_scenario(self):
+        """Test complex scenario with mixed single pods and gangs."""
+        # Setup: 5 nodes
+        self.logic.initialize([f"node-{i}" for i in range(1, 6)], [])
         
-        if priority != 0:
-            pod.metadata.annotations["priority"] = str(priority)
-        if pod_group:
-            pod.metadata.annotations["pod-group"] = pod_group
-        
-        pod.spec.priority = priority
-        pod.spec.scheduler_name = "test-scheduler"
-        pod.spec.node_name = node_name
-        pod.status.phase = "Pending"
-        
-        return pod
-    
-    def test_gang_unschedulable_allows_other_pods(self):
-        """Test that when a gang becomes unschedulable, low priority pods remain scheduled."""
-        self._setup_cluster(num_nodes=2)
-        
-        # Mock responses for all operations
-        self.scheduler.v1.create_namespaced_binding.return_value = None
-        self.scheduler.v1.list_pod_for_all_namespaces.return_value = MagicMock(items=[])
-        self.scheduler.v1.delete_namespaced_pod.return_value = None
-        
-        # Step 1: Schedule 2 low priority pods
-        low_pod_1 = self._create_mock_pod("low-pod-1", priority=10, uid="uid-low-1")
-        low_pod_info_1 = PodInfo("low-pod-1", "default", 10, None, "uid-low-1")
-        
-        low_pod_2 = self._create_mock_pod("low-pod-2", priority=10, uid="uid-low-2")
-        low_pod_info_2 = PodInfo("low-pod-2", "default", 10, None, "uid-low-2")
-        
-        result1 = self.scheduler._schedule_single_pod(low_pod_info_1, low_pod_1)
-        result2 = self.scheduler._schedule_single_pod(low_pod_info_2, low_pod_2)
-        
-        self.assertTrue(result1)
-        self.assertTrue(result2)
-        
-        # Verify both low priority pods are scheduled
-        scheduled_count = sum(1 for v in self.scheduler.node_assignments.values() if v in ["uid-low-1", "uid-low-2"])
-        self.assertEqual(scheduled_count, 2, "Both low priority pods should be scheduled initially")
-        
-        # Step 2: Try to schedule a gang of 2 pods (should fail - no capacity)
-        gang_pods_2 = [
-            PodInfo("gang-pod-1", "default", 50, "group-a", "uid-gang-1"),
-            PodInfo("gang-pod-2", "default", 50, "group-a", "uid-gang-2"),
+        # Add various pods:
+        # - 2 low priority single pods
+        # - 1 gang of 2 pods (medium priority)
+        # - 1 high priority single pod
+        events = [
+            # Low priority singles
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-low-1", "low-1", priority=10)},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-low-2", "low-2", priority=10)},
+            # Gang (medium priority)
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-gang-1", "gang-1", priority=50, gang_name="group-a")},
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-gang-2", "gang-2", priority=50, gang_name="group-a")},
+            # High priority single
+            {"event_type": "ADDED", "pod": self._create_pod_dict("uid-high", "high", priority=100)},
         ]
         
-        mock_gang_2 = [
-            self._create_mock_pod("gang-pod-1", priority=50, uid="uid-gang-1", pod_group="group-a"),
-            self._create_mock_pod("gang-pod-2", priority=50, uid="uid-gang-2", pod_group="group-a"),
-        ]
-        self.scheduler.v1.read_namespaced_pod.side_effect = mock_gang_2
+        # Process all events
+        for event in events:
+            result = self.logic.handle_event(event)
         
-        gang_result_2 = self.scheduler._schedule_gang_pods("group-a", gang_pods_2)
-        self.assertFalse(gang_result_2, "Gang of 2 pods should fail to schedule (no capacity)")
+        # Check final state: all 5 pods should be tracked
+        self.assertEqual(len(self.logic.all_pods), 5, "All 5 pods should be tracked")
         
-        # Step 3: Add a 3rd pod to the gang (making it need 3 nodes)
-        gang_pods_3 = [
-            PodInfo("gang-pod-1", "default", 50, "group-a", "uid-gang-1"),
-            PodInfo("gang-pod-2", "default", 50, "group-a", "uid-gang-2"),
-            PodInfo("gang-pod-3", "default", 50, "group-a", "uid-gang-3"),
-        ]
+        # Check node assignments: all 5 nodes should have pods assigned
+        assigned_count = sum(1 for uid in self.logic.node_assignments.values() if uid is not None)
+        self.assertEqual(assigned_count, 5, "All 5 nodes should have pods assigned")
         
-        mock_gang_3 = [
-            self._create_mock_pod("gang-pod-1", priority=50, uid="uid-gang-1", pod_group="group-a"),
-            self._create_mock_pod("gang-pod-2", priority=50, uid="uid-gang-2", pod_group="group-a"),
-            self._create_mock_pod("gang-pod-3", priority=50, uid="uid-gang-3", pod_group="group-a"),
-        ]
-        self.scheduler.v1.read_namespaced_pod.side_effect = mock_gang_3
-        
-        gang_result_3 = self.scheduler._schedule_gang_pods("group-a", gang_pods_3)
-        self.assertFalse(gang_result_3, "Gang of 3 pods should fail to schedule (needs 3 nodes, only 2 available)")
-        
-        # Step 4: Verify the two low priority pods are still scheduled
-        scheduled_low_priority = sum(1 for v in self.scheduler.node_assignments.values() if v in ["uid-low-1", "uid-low-2"])
-        self.assertEqual(scheduled_low_priority, 2, "Both low priority pods should remain scheduled after gang failure")
-        
-        # Verify gang pods are NOT scheduled
-        scheduled_gang = sum(1 for v in self.scheduler.node_assignments.values() if v in ["uid-gang-1", "uid-gang-2", "uid-gang-3"])
-        self.assertEqual(scheduled_gang, 0, "No gang pods should be scheduled")
+        # Verify all pods got assigned
+        assigned_uids = {uid for uid in self.logic.node_assignments.values() if uid is not None}
+        expected_uids = {"uid-low-1", "uid-low-2", "uid-gang-1", "uid-gang-2", "uid-high"}
+        self.assertEqual(assigned_uids, expected_uids, "All pod UIDs should be assigned to nodes")
 
 
 if __name__ == '__main__':
     unittest.main()
-

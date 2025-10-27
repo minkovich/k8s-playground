@@ -1,0 +1,135 @@
+---
+# Example: High-priority deployment (priority increased by 1)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: high-priority-app-v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: high-priority-app-v2
+  template:
+    metadata:
+      labels:
+        app: high-priority-app-v2
+      annotations:
+        priority: "101"
+    spec:
+      schedulerName: custom-scheduler
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+---
+# Example: Low-priority deployment (priority increased by 1)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: low-priority-app-v2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: low-priority-app-v2
+  template:
+    metadata:
+      labels:
+        app: low-priority-app-v2
+      annotations:
+        priority: "11"
+    spec:
+      schedulerName: custom-scheduler
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+---
+# Example: Gang-scheduled deployment (group A-v2, pod 1 of 3)
+# Split into separate single-replica deployments for easier testing
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gang-app-a-v2-1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gang-app-a-v2-1
+  template:
+    metadata:
+      labels:
+        app: gang-app-a-v2-1
+      annotations:
+        priority: "51"
+        pod-group: "group-a-v2"
+    spec:
+      schedulerName: custom-scheduler
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+---
+# Example: Gang-scheduled deployment (group A-v2, pod 2 of 3)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gang-app-a-v2-2
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gang-app-a-v2-2
+  template:
+    metadata:
+      labels:
+        app: gang-app-a-v2-2
+      annotations:
+        priority: "51"
+        pod-group: "group-a-v2"
+    spec:
+      schedulerName: custom-scheduler
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+---
+# Example: Gang-scheduled deployment (group A-v2, pod 3 of 3)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gang-app-a-v2-3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gang-app-a-v2-3
+  template:
+    metadata:
+      labels:
+        app: gang-app-a-v2-3
+      annotations:
+        priority: "51"
+        pod-group: "group-a-v2"
+    spec:
+      schedulerName: custom-scheduler
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+

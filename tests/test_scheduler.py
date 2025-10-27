@@ -375,23 +375,126 @@ class TestSchedulingLogic(unittest.TestCase):
             }
             result = self.logic.handle_event(event)
         
-        # Verify scheduling queue order: smaller units should come first
-        self.assertEqual(len(self.logic.scheduling_queue), 3, "Should have 3 units in queue")
+        # After all pods are added:
+        # - Gang members were scheduled first (as they arrived), then preempted by single pods
+        # - Gang is now in transition (waiting_on_deletion=True for all members)
+        # - Only single pods are in the queue (gang filtered out due to in-transition state)
+        self.assertEqual(len(self.logic.scheduling_queue), 2, "Should have 2 units in queue (single pods)")
         
-        # Check that single pods (size 1) come before gang (size 3)
-        queue_sizes = [len(unit.pods) for unit in self.logic.scheduling_queue]
-        self.assertEqual(queue_sizes, [1, 1, 3], 
-                        "Smaller units should be ordered before larger ones when priorities are equal")
-        
-        # Verify scheduling result: single pods should be scheduled, gang should not fit
+        # Verify scheduling result: single pods should be scheduled
         assigned_pods = [uid for uid in self.logic.node_assignments.values() if uid]
         self.assertEqual(len(assigned_pods), 2, "Only 2 pods should be scheduled (the single pods)")
         self.assertIn("single-1", assigned_pods, "single-1 should be scheduled")
         self.assertIn("single-2", assigned_pods, "single-2 should be scheduled")
         
-        # Gang should not be scheduled (not enough capacity left)
+        # Gang should not be scheduled (preempted and in transition)
         for i in range(1, 4):
             self.assertNotIn(f"gang-{i}", assigned_pods, f"gang-{i} should not be scheduled")
+        
+        # Verify gang is in transition (waiting for delete→re-add cycle)
+        self.assertIn("big-gang", self.logic.gangs_in_transition, "Gang should be in transition after preemption")
+        
+        # Verify all gang members are marked as waiting_on_deletion
+        gang_pods = [p for p in self.logic.all_pods.values() if p.gang_name == "big-gang"]
+        self.assertEqual(len(gang_pods), 3, "All 3 gang members should still be tracked")
+        self.assertTrue(all(p.waiting_on_deletion for p in gang_pods), 
+                       "All gang members should be waiting on deletion")
+    
+    def test_gang_in_transition_allows_lower_priority_scheduling(self):
+        """Test that lower priority pods can be scheduled when gang is in transition."""
+        # Setup: 1 node available
+        nodes = ["node-1"]
+        self.logic.initialize(nodes, [])
+        
+        # Step 1: Add low priority pod (priority 10)
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("low-1", "low-1", priority=10)
+        }
+        result = self.logic.handle_event(event)
+        
+        # Low priority pod should be scheduled (node is free)
+        self.assertEqual(len(result["actions"]), 1)
+        self.assertEqual(result["actions"][0]["action"], "bind")
+        self.assertEqual(result["actions"][0]["pod_uid"], "low-1")
+        self.assertEqual(self.logic.node_assignments["node-1"], "low-1")
+        
+        # Step 2: Add first high priority gang member (priority 50)
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("gang-1", "gang-1", priority=50, gang_name="high-gang")
+        }
+        result = self.logic.handle_event(event)
+        
+        # Should preempt low-1 and schedule gang-1
+        actions_by_type = {}
+        for action in result["actions"]:
+            action_type = action["action"]
+            if action_type not in actions_by_type:
+                actions_by_type[action_type] = []
+            actions_by_type[action_type].append(action["pod_uid"])
+        
+        self.assertIn("preempt", actions_by_type)
+        self.assertIn("low-1", actions_by_type["preempt"])
+        self.assertIn("bind", actions_by_type)
+        self.assertIn("gang-1", actions_by_type["bind"])
+        
+        # Step 2.5: Simulate low-1 being deleted and re-added (as would happen in real K8s)
+        # Delete low-1
+        delete_event = {
+            "event_type": "DELETED",
+            "pod": self._create_pod_dict("low-1", "low-1", priority=10)
+        }
+        self.logic.handle_event(delete_event)
+        
+        # Re-add low-1 (simulating controller recreating it)
+        add_event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("low-1", "low-1", priority=10)
+        }
+        self.logic.handle_event(add_event)
+        
+        # Step 3: Add second high priority gang member
+        event = {
+            "event_type": "ADDED",
+            "pod": self._create_pod_dict("gang-2", "gang-2", priority=50, gang_name="high-gang")
+        }
+        result = self.logic.handle_event(event)
+        
+        # Gang needs 2 nodes but only 1 available
+        # Gang should be preempted, low-1 should be scheduled
+        actions_by_type = {}
+        for action in result["actions"]:
+            action_type = action["action"]
+            if action_type not in actions_by_type:
+                actions_by_type[action_type] = []
+            actions_by_type[action_type].append(action["pod_uid"])
+        
+        # Gang members should be preempted
+        self.assertIn("preempt", actions_by_type)
+        self.assertIn("gang-1", actions_by_type["preempt"])
+        
+        # Low priority pod should be scheduled
+        self.assertIn("bind", actions_by_type)
+        self.assertIn("low-1", actions_by_type["bind"])
+        
+        # Verify final state
+        self.assertEqual(self.logic.node_assignments["node-1"], "low-1", "Low priority pod should be scheduled")
+        
+        # Verify gang is in transition
+        self.assertIn("high-gang", self.logic.gangs_in_transition, "Gang should be in transition")
+        
+        # Verify gang members state
+        gang_pods = [p for p in self.logic.all_pods.values() if p.gang_name == "high-gang"]
+        self.assertEqual(len(gang_pods), 2, "Both gang members should be tracked")
+        
+        # gang-1 was scheduled then preempted, so it should be waiting on deletion
+        gang_1 = next(p for p in gang_pods if p.uid == "gang-1")
+        self.assertTrue(gang_1.waiting_on_deletion, "gang-1 should be waiting on deletion")
+        
+        # gang-2 was never scheduled, so it doesn't need to wait for deletion
+        gang_2 = next(p for p in gang_pods if p.uid == "gang-2")
+        self.assertFalse(gang_2.waiting_on_deletion, "gang-2 was never scheduled, doesn't need deletion")
 
 
 class TestSchedulingIntegration(unittest.TestCase):

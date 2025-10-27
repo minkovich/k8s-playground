@@ -32,6 +32,7 @@ class CustomScheduler:
         self.logic = SchedulingLogic()
         self.last_reinit_time = 0  # Track when we last re-initialized
         self.reinit_cooldown = 30  # Minimum seconds between re-inits
+        self.reinit_sleep_delay = 3  # Seconds to wait before re-init to let cluster settle
         
         logger.info(f"Custom scheduler '{scheduler_name}' initialized")
     
@@ -93,7 +94,7 @@ class CustomScheduler:
             self.last_reinit_time = current_time
             
             # Wait for in-flight operations to complete and cluster state to settle
-            time.sleep(10)
+            time.sleep(self.reinit_sleep_delay)
             
             # Create fresh SchedulingLogic instance (clears all state)
             self.logic = SchedulingLogic()
@@ -101,7 +102,7 @@ class CustomScheduler:
             # Re-read cluster state
             self.initialize_cluster_state()
             
-            logger.info("Successfully re-initialized scheduler state")
+            logger.debug("Successfully re-initialized scheduler state")
             return True
         except Exception as e:
             logger.error(f"Failed to re-initialize scheduler state: {e}", exc_info=True)
@@ -145,9 +146,7 @@ class CustomScheduler:
         """Execute scheduling actions returned by logic layer."""
         if not actions:
             return
-        
-        logger.info(f"Executing {len(actions)} actions")
-        
+                
         for action in actions:
             action_type = action["action"]
             
@@ -182,7 +181,7 @@ class CustomScheduler:
                 _preload_content=False
             )
             
-            logger.info(f"Successfully bound pod {pod_namespace}/{pod_name} to node {node_name}")
+            logger.debug(f"Successfully bound pod {pod_namespace}/{pod_name} to node {node_name}")
             return True
             
         except ApiException as e:
@@ -208,14 +207,13 @@ class CustomScheduler:
                 return False  # Bind failed, but we handled it gracefully
             elif e.status == 409:
                 # Conflict - pod may already be bound. Check if it's bound to our target node.
-                logger.warning(f"Conflict (409) binding pod {pod_namespace}/{pod_name} to {node_name} - checking current state")
                 
                 try:
                     pod = self.v1.read_namespaced_pod(name=pod_name, namespace=pod_namespace)
                     
                     # Check if pod is already bound to the target node
                     if pod.spec.node_name == node_name:
-                        logger.info(f"Pod {pod_namespace}/{pod_name} already bound to {node_name} - treating as success (idempotent)")
+                        logger.debug(f"Pod {pod_namespace}/{pod_name} already bound to {node_name} - treating as success (idempotent)")
                         return True
                     else:
                         logger.error(f"Pod {pod_namespace}/{pod_name} bound to different node: {pod.spec.node_name} (expected {node_name})")
@@ -249,8 +247,8 @@ class CustomScheduler:
                 )
             )
             
-            logger.info(f"Pod {pod_namespace}/{pod_name} deleted. "
-                       f"Controller will recreate it as Pending if applicable")
+            logger.debug(f"Pod {pod_namespace}/{pod_name} deleted. "
+                         f"Controller will recreate it as Pending if applicable")
             return True
             
         except ApiException as e:
@@ -259,6 +257,7 @@ class CustomScheduler:
                 logger.info(f"Pod {pod_namespace}/{pod_name} already deleted (404) - goal achieved")
                 return True
             else:
+                # This is really bad since we already remove the state in scheduling_logic.py. Reconsider this logic flow.
                 logger.error(f"Failed to preempt pod {pod_namespace}/{pod_name}: status:{e.status} {e}")
                 self._safe_reinitialize(f"preempt failure for {pod_namespace}/{pod_name}")
                 return False
@@ -278,18 +277,19 @@ class CustomScheduler:
                 # Only process pods that use our scheduler
                 if pod.spec.scheduler_name != self.scheduler_name:
                     continue
-                
-                # Filter out terminal phases
-                if pod.status.phase in ['Succeeded', 'Failed']:
-                    logger.debug(f"Ignoring pod {pod.metadata.namespace}/{pod.metadata.name} "
-                                f"in terminal phase {pod.status.phase}")
+
+                # only handle ADDED/DELETED events
+                if event_type not in ["ADDED", "DELETED"]:
                     continue
 
-                # TODO: Need to understand why these are coming in with old mapping information
-                if event_type == "MODIFIED" and "Pending" in pod.status.phase:
-                    logger.debug(f"Ignoring pod {pod.metadata.namespace}/{pod.metadata.name} "
-                                f"in pending phase {pod.status.phase}")
-                    continue
+                # an advanced scheduler would buffer events and process them in batches but 
+                # that would greatly increase complexity by combining sync and async processing
+                # and debugging would be an order of magnitude more difficult
+
+                # as a single hack, assume no one adds a single pod at a time so we can sleep for 10 
+                # second and re-read the state of the cluster
+                if event_type == "ADDED":
+                    self._safe_reinitialize(f"New pod added and re-read the state of the cluster")
                 
                 logger.info(f"Event: {event_type} for pod {pod.metadata.namespace}/{pod.metadata.name}, "
                            f"node={pod.spec.node_name} phase={pod.status.phase}")
@@ -305,10 +305,6 @@ class CustomScheduler:
                 # Execute actions
                 self._execute_actions(result["actions"])
                 
-                # Log scheduler state
-                logger.info(f"Nodes: {len(self.logic.node_assignments)}, "
-                           f"Total pods: {len(self.logic.all_pods)}, "
-                           f"Queue units: {len(self.logic.scheduling_queue)}")
         
         except Exception as e:
             logger.error(f"Error in scheduler main loop: {e}", exc_info=True)

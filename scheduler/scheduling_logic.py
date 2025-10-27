@@ -6,7 +6,7 @@ Implements priority-based scheduling, preemption, and gang-scheduling.
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +23,7 @@ class PodInfo:
     namespace: str
     priority: int
     gang_name: Optional[str]
+    waiting_on_deletion: bool = False
 
 
 @dataclass
@@ -70,6 +71,9 @@ class SchedulingLogic:
         # Ordered list of scheduling units (single pods or gangs) sorted by priority
         self.scheduling_queue: List[SchedulingUnit] = []
         
+        # Track gangs that are in transition (being reformed after preemption)
+        self.gangs_in_transition: Set[str] = set()
+        
         logger.info("Scheduling logic initialized")
     
     def _get_pod_node(self, pod_uid: str) -> Optional[str]:
@@ -111,7 +115,8 @@ class SchedulingLogic:
                 name=pod_dict["name"],
                 namespace=pod_dict["namespace"],
                 priority=pod_dict["priority"],
-                gang_name=pod_dict.get("gang_name")
+                gang_name=pod_dict.get("gang_name"),
+                waiting_on_deletion=False  # Existing pods are not waiting on deletion
             )
             self.all_pods[pod_info.uid] = pod_info
             
@@ -124,8 +129,7 @@ class SchedulingLogic:
         
         # Create initial plan for pending pods
         plan = self._create_scheduling_plan()
-        actions = self._plan_to_actions(plan)
-        
+        actions = self._plan_to_actions(plan)        
         return {"actions": actions}
     
     def handle_event(self, event: dict) -> dict:
@@ -152,16 +156,32 @@ class SchedulingLogic:
             name=pod_dict["name"],
             namespace=pod_dict["namespace"],
             priority=pod_dict["priority"],
-            gang_name=pod_dict.get("gang_name")
+            gang_name=pod_dict.get("gang_name"),
+            waiting_on_deletion=False  # New/modified pods are not waiting on deletion
         )
         
-        logger.debug(f"Processing event {event_type} for pod {pod_info.namespace}/{pod_info.name}")
+        logger.debug(f"Processing event {event_type} for pod {pod_info.namespace}/{pod_info.name} and node {node_name}")
         # print state of all_pods
         logger.debug(f"All pods: {self.all_pods}")
         logger.debug(f"Node assignments: {self.node_assignments}")
 
         if event_type == "DELETED":
             self._handle_deleted(pod_info)
+        elif event_type == "MODIFIED": # verify they are all boring events
+            # check if the pod is already in the all_pods .. this happens when it's pending deletetion
+            if pod_info.uid not in self.all_pods:
+                logger.debug(f"\tMODIFIED Pod {pod_info.namespace}/{pod_info.name} -> {node_name} pending deletion?")
+                return {"actions": []}
+            
+            # if node_name exists and node assignment is different from the one in the pod, throw an error
+            if node_name and self.node_assignments[node_name] != pod_info.uid:
+                logger.error(f"MODIFIED Pod {pod_info.namespace}/{pod_info.name} is assigned to node {node_name} but the node assignment is {self.node_assignments[node_name]}")
+                return {"actions": []}
+            
+            # if node_names doesn't exist, it's unexpected, throw an error
+            if not node_name:
+                logger.error(f"MODIFIED Pod {pod_info.namespace}/{pod_info.name} has no node_name")
+                return {"actions": []}
         elif event_type == "ADDED":
             # Add/update the pod
             self.all_pods[pod_info.uid] = pod_info
@@ -170,12 +190,37 @@ class SchedulingLogic:
             if node_name and node_name in self.node_assignments:
                 self.node_assignments[node_name] = pod_info.uid
                 logger.debug(f"Pod {pod_info.namespace}/{pod_info.name} added to node {node_name} and reverse lookup in all_pods: {self.all_pods[pod_info.uid]}")
+            
+            # Check if this completes a gang reformation
+            if pod_info.gang_name and pod_info.gang_name in self.gangs_in_transition:
+                self._check_gang_reformation_complete(pod_info.gang_name)
         
         # Create and return new plan
         plan = self._create_scheduling_plan()
         actions = self._plan_to_actions(plan)
-        
+
         return {"actions": actions}
+    
+    def _check_gang_reformation_complete(self, gang_name: str):
+        """
+        Check if a gang in transition has completed reformation.
+        A gang is complete when all members are present and none are waiting_on_deletion.
+        """
+        gang_pods = [p for p in self.all_pods.values() if p.gang_name == gang_name]
+        
+        # Check if any member is still waiting on deletion
+        if any(p.waiting_on_deletion for p in gang_pods):
+            logger.debug(f"Gang {gang_name} still has members waiting on deletion")
+            return
+        
+        # Check if we have members (empty means all deleted, still in transition)
+        if len(gang_pods) == 0:
+            logger.debug(f"Gang {gang_name} has no members yet")
+            return
+        
+        # Gang is complete - remove from transition
+        self.gangs_in_transition.discard(gang_name)
+        logger.info(f"Gang {gang_name} reformation complete with {len(gang_pods)} members")
     
     def _handle_deleted(self, pod_info: PodInfo):
         """Handle a pod deletion event."""
@@ -198,6 +243,10 @@ class SchedulingLogic:
         gangs = {}  # gang_name -> list of PodInfo
         
         for pod_info in self.all_pods.values():
+            # Skip pods waiting on deletion
+            if pod_info.waiting_on_deletion:
+                continue
+            
             if pod_info.gang_name:
                 # Gang pod - collect by gang_name
                 if pod_info.gang_name not in gangs:
@@ -221,6 +270,16 @@ class SchedulingLogic:
         
         # Create units for gangs
         for gang_name, gang_pods in gangs.items():
+            # Skip gang if any member is waiting on deletion
+            if any(p.waiting_on_deletion for p in gang_pods):
+                logger.debug(f"Skipping gang {gang_name} - has members waiting on deletion")
+                continue
+            
+            # Skip gang if it's in transition (being reformed after preemption)
+            if gang_name in self.gangs_in_transition:
+                logger.debug(f"Skipping gang {gang_name} - in transition after preemption")
+                continue
+            
             min_priority = min(p.priority for p in gang_pods)
             unit = SchedulingUnit(
                 pods=gang_pods,
@@ -290,9 +349,18 @@ class SchedulingLogic:
                         "pod_namespace": pod_info.namespace
                     })
                     preempted_pods.append(pod_uid)
+                    
+                    # Mark pod as waiting on deletion
+                    self.all_pods[pod_uid].waiting_on_deletion = True
+                    
+                    # If this is a gang member, mark the gang as in transition
+                    if pod_info.gang_name:
+                        self.gangs_in_transition.add(pod_info.gang_name)
+                        logger.debug(f"Gang {pod_info.gang_name} marked as in-transition")
                 else:
                     logger.error(f"Pod {pod_uid} not found in all_pods")
                 self.node_assignments[node] = None  # Free the node
+                
         logger.debug(f"Preempted pods: {preempted_pods}")
 
         # Step 3: Find available nodes (not assigned or just freed)
